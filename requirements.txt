@@ -1,0 +1,4 @@
+python-telegram-bot==21.8
+aiohttp==3.10.10
+python-dotenv==1.0.1
+asyncpg==0.29.0
