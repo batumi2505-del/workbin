@@ -68,9 +68,54 @@ bin_db = {}
 _db_pool: asyncpg.Pool | None = None
 _db_lock = asyncio.Lock()
 
+# HTTP session (одна на весь процесс)
+_http_session: aiohttp.ClientSession | None = None
+
 # Rapira cache
 _rapira_cache = {"ts": 0.0, "data": None}
 _RAPIRA_CACHE_SECONDS = 30
+
+
+# =========================
+# Utils
+# =========================
+def today_str() -> str:
+    return datetime.now(TZ).strftime("%Y-%m-%d")
+
+def now_iso() -> str:
+    return datetime.now(TZ).isoformat(timespec="seconds")
+
+def is_admin_user(update: Update) -> bool:
+    return ADMIN_ID != 0 and update.effective_user and update.effective_user.id == ADMIN_ID
+
+def build_menu(is_admin: bool) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton("🤝 Сотрудничество"), KeyboardButton("📈 Курс Rapira")]
+    ]
+    if is_admin:
+        rows.append([KeyboardButton("📊 Статистика"), KeyboardButton("📣 Рассылка")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def fire_and_forget(task: asyncio.Task):
+    """Чтобы фоновые задачи не падали молча и не ломали апдейты."""
+    def _done(t: asyncio.Task):
+        try:
+            t.result()
+        except Exception as e:
+            logger.error(f"Background task error: {e}")
+    task.add_done_callback(_done)
+
+
+# =========================
+# HTTP session (re-use)
+# =========================
+async def get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        timeout = aiohttp.ClientTimeout(total=8)
+        connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+        _http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    return _http_session
 
 
 # =========================
@@ -81,6 +126,7 @@ async def _db_connect():
     if _db_pool is None:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL не задан. Добавь в .env и в Render Env.")
+        # max_size можно увеличить, но 5 обычно достаточно
         _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
 async def _db_init_schema():
@@ -147,17 +193,14 @@ async def db_fetchall(query: str, params=()):
         return await conn.fetch(query, *params)
 
 
-def today_str() -> str:
-    return datetime.now(TZ).strftime("%Y-%m-%d")
-
-def now_iso() -> str:
-    return datetime.now(TZ).isoformat(timespec="seconds")
-
+async def ensure_daily_row(day: str):
+    await db_execute(
+        "INSERT INTO daily (day, starts, requests, unique_users) VALUES ($1, 0, 0, 0) "
+        "ON CONFLICT (day) DO NOTHING",
+        (day,)
+    )
 
 async def mark_unique_user_day(user_id: int, day: str) -> bool:
-    """
-    Возвращает True, если это первая активность юзера в этот day.
-    """
     row = await db_fetchone(
         """
         INSERT INTO user_day (user_id, day)
@@ -169,32 +212,23 @@ async def mark_unique_user_day(user_id: int, day: str) -> bool:
     )
     return row is not None
 
-
-async def ensure_daily_row(day: str):
-    await db_execute(
-        "INSERT INTO daily (day, starts, requests, unique_users) VALUES ($1, 0, 0, 0) ON CONFLICT (day) DO NOTHING",
-        (day,)
-    )
-
-
+# ✅ Оптимизация: UPSERT вместо SELECT + INSERT/UPDATE
 async def upsert_user(user_id: int, username: str | None):
     day = today_str()
     await ensure_daily_row(day)
 
-    row = await db_fetchone("SELECT user_id FROM users WHERE user_id = $1", (user_id,))
-    if row is None:
-        await db_execute(
-            "INSERT INTO users (user_id, username, first_seen, last_seen, starts, requests) VALUES ($1, $2, $3, $4, 0, 0)",
-            (user_id, username or "", now_iso(), now_iso())
-        )
-    else:
-        # username обновляем только если прилетел непустой
-        new_username = username if username else None
-        await db_execute(
-            "UPDATE users SET username = COALESCE($1, username), last_seen = $2 WHERE user_id = $3",
-            (new_username, now_iso(), user_id)
-        )
-
+    new_username = username if username else None
+    ts = now_iso()
+    await db_execute(
+        """
+        INSERT INTO users (user_id, username, first_seen, last_seen, starts, requests)
+        VALUES ($1, $2, $3, $4, 0, 0)
+        ON CONFLICT (user_id) DO UPDATE SET
+            username  = COALESCE(EXCLUDED.username, users.username),
+            last_seen = EXCLUDED.last_seen
+        """,
+        (user_id, new_username, ts, ts)
+    )
 
 async def inc_start(user_id: int):
     day = today_str()
@@ -207,7 +241,6 @@ async def inc_start(user_id: int):
     await db_execute("UPDATE users SET starts = starts + 1, last_seen = $1 WHERE user_id = $2", (now_iso(), user_id))
     await db_execute("UPDATE daily SET starts = starts + 1 WHERE day = $1", (day,))
 
-
 async def inc_request(user_id: int):
     day = today_str()
     await ensure_daily_row(day)
@@ -218,7 +251,6 @@ async def inc_request(user_id: int):
 
     await db_execute("UPDATE users SET requests = requests + 1, last_seen = $1 WHERE user_id = $2", (now_iso(), user_id))
     await db_execute("UPDATE daily SET requests = requests + 1 WHERE day = $1", (day,))
-
 
 async def get_stats_text() -> str:
     day = today_str()
@@ -272,7 +304,6 @@ def load_db():
         logger.error(f"Ошибка загрузки базы: {str(e)}")
         return False
 
-
 def get_card_scheme(bin_code: str) -> str:
     """Определение платёжной системы по BIN-коду"""
     if not bin_code.isdigit() or len(bin_code) < 6:
@@ -292,21 +323,6 @@ def get_card_scheme(bin_code: str) -> str:
 
 
 # =========================
-# Menus
-# =========================
-def build_menu(is_admin: bool) -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton("🤝 Сотрудничество"), KeyboardButton("📈 Курс Rapira")]
-    ]
-    if is_admin:
-        rows.append([KeyboardButton("📊 Статистика"), KeyboardButton("📣 Рассылка")])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
-def is_admin_user(update: Update) -> bool:
-    return ADMIN_ID != 0 and update.effective_user and update.effective_user.id == ADMIN_ID
-
-
-# =========================
 # Rapira rate
 # =========================
 async def fetch_rapira_usdt_rub() -> dict | None:
@@ -320,17 +336,17 @@ async def fetch_rapira_usdt_rub() -> dict | None:
 
     url = "https://api.rapira.net/open/market/rates"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers={"Accept": "application/json"}, timeout=10) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-                items = data.get("data", [])
-                for item in items:
-                    if item.get("symbol") == "USDT/RUB":
-                        _rapira_cache["ts"] = now_ts
-                        _rapira_cache["data"] = item
-                        return item
+        session = await get_http_session()
+        async with session.get(url, headers={"Accept": "application/json"}) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            items = data.get("data", [])
+            for item in items:
+                if item.get("symbol") == "USDT/RUB":
+                    _rapira_cache["ts"] = now_ts
+                    _rapira_cache["data"] = item
+                    return item
     except Exception as e:
         logger.error(f"Rapira API error: {e}")
     return None
@@ -348,11 +364,8 @@ def pan_to_hash(pan_digits: str) -> str:
     digest = hashlib.sha256((salt + pan_digits).encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")[:32]
 
-
 async def inc_pan_hash(h: str) -> int:
-    """
-    Атомарно увеличиваем cnt, возвращаем новое значение
-    """
+    """Атомарно увеличиваем cnt, возвращаем новое значение"""
     row = await db_fetchone(
         """
         INSERT INTO pan_hash (h, cnt)
@@ -364,11 +377,9 @@ async def inc_pan_hash(h: str) -> int:
     )
     return int(row["cnt"])
 
-
 async def get_pan_flag(h: str) -> bool:
     row = await db_fetchone("SELECT is_problem FROM pan_flags WHERE h = $1", (h,))
     return bool(row and int(row["is_problem"]) == 1)
-
 
 async def set_pan_flag(h: str, user_id: int, is_problem: bool):
     await db_execute(
@@ -385,12 +396,28 @@ async def set_pan_flag(h: str, user_id: int, is_problem: bool):
 
 
 # =========================
+# Background tracking (ускорение ответа)
+# =========================
+async def track_start_bg(user_id: int, username: str | None):
+    await upsert_user(user_id, username)
+    await inc_start(user_id)
+
+async def track_request_bg(user_id: int, username: str | None):
+    # не влияет на текст ответа (кроме full PAN счётчика — он отдельно)
+    await upsert_user(user_id, username)
+    await inc_request(user_id)
+
+
+# =========================
 # Handlers
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    await upsert_user(user.id, user.username if user else None)
-    await inc_start(user.id)
+    if not user:
+        return
+
+    # ✅ ускоряем: учёт делаем в фоне
+    fire_and_forget(asyncio.create_task(track_start_bg(user.id, user.username)))
 
     await update.message.reply_text(
         "🔍 Привет!\n\n"
@@ -404,13 +431,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=build_menu(is_admin_user(update))
     )
 
-
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_user(update):
         return
     text = await get_stats_text()
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=build_menu(True))
-
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_user(update):
@@ -422,13 +447,11 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=build_menu(True)
     )
 
-
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_user(update):
         return
     context.user_data.pop("awaiting_broadcast", None)
     await update.message.reply_text("✅ Отменено.", reply_markup=build_menu(True))
-
 
 async def do_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await db_fetchall("SELECT user_id FROM users")
@@ -461,7 +484,6 @@ async def do_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=admin_chat_id,
         text=f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}"
     )
-
 
 async def flag_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -499,11 +521,13 @@ async def check_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text_raw = (update.message.text or "").strip()
 
+    # Admin flow: broadcast
     if is_admin_user(update) and context.user_data.get("awaiting_broadcast"):
         context.user_data["awaiting_broadcast"] = False
         await do_broadcast(update, context)
         return
 
+    # Menu buttons
     if text_raw == "🤝 Сотрудничество":
         await update.message.reply_text(COOP_TEXT, parse_mode="HTML", reply_markup=build_menu(is_admin_user(update)))
         return
@@ -537,6 +561,7 @@ async def check_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await broadcast_cmd(update, context)
         return
 
+    # Card check
     digits = "".join(ch for ch in text_raw if ch.isdigit())
 
     if len(digits) < 6:
@@ -547,8 +572,8 @@ async def check_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await upsert_user(user.id, user.username)
-    await inc_request(user.id)
+    # ✅ ускоряем: учёт запроса делаем в фоне (не влияет на ответ)
+    fire_and_forget(asyncio.create_task(track_request_bg(user.id, user.username)))
 
     is_full_pan = len(digits) >= 12
 
@@ -557,6 +582,7 @@ async def check_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     issuer = "Unknown"
     country = "Unknown"
 
+    # BIN lookup: локальная база -> иначе binlist
     if bin_code in bin_db:
         data = bin_db[bin_code]
         issuer = data.get("Issuer", issuer)
@@ -565,12 +591,12 @@ async def check_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             url = f"https://lookup.binlist.net/{bin_code}"
             headers = {"Accept-Version": "3"}
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, timeout=5) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        issuer = data.get("bank", {}).get("name", issuer)
-                        country = data.get("country", {}).get("name", country)
+            session = await get_http_session()
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    issuer = data.get("bank", {}).get("name", issuer)
+                    country = data.get("country", {}).get("name", country)
         except Exception as e:
             logger.error(f"BINLIST API error: {str(e)}")
 
@@ -579,11 +605,14 @@ async def check_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_full_pan:
         h = pan_to_hash(digits)
-        cnt = await inc_pan_hash(h)
 
-        is_problem = await get_pan_flag(h)
+        # ✅ ускоряем: cnt и flag параллельно
+        cnt, is_problem = await asyncio.gather(
+            inc_pan_hash(h),
+            get_pan_flag(h)
+        )
+
         problem_line = "\n⚠️ <b>Метка</b>: карта отмечена как проблемная" if is_problem else ""
-
         extra = f"\n\n🔁 <b>Запросов по этому номеру</b>: {cnt}{problem_line}"
 
         reply_markup_inline = InlineKeyboardMarkup([[
@@ -617,15 +646,14 @@ def build_web_app(application: Application) -> web.Application:
                 return web.Response(text="Forbidden", status=403)
 
         data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.update_queue.put(update)
+        upd = Update.de_json(data, application.bot)
+        await application.update_queue.put(upd)
         return web.Response(text="OK", status=200)
 
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
     app.router.add_post("/telegram", telegram_webhook)
     return app
-
 
 async def run_http_server(port: int, application: Application):
     app = build_web_app(application)
@@ -703,6 +731,21 @@ async def run_bot():
                 await application.bot.delete_webhook(drop_pending_updates=False)
         except Exception:
             pass
+
+        try:
+            global _http_session
+            if _http_session and not _http_session.closed:
+                await _http_session.close()
+        except Exception:
+            pass
+
+        try:
+            global _db_pool
+            if _db_pool is not None:
+                await _db_pool.close()
+        except Exception:
+            pass
+
         await application.stop()
         await application.shutdown()
         await http_runner.cleanup()
