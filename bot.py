@@ -53,11 +53,33 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")  # Supabase Pooler Session URL
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")    # https://<service>.onrender.com/telegram
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # любая строка (желательно 32+ символа)
 
-# Тексты меню (подправь под себя)
-COOP_TEXT = (
-    "🤝 <b>Сотрудничество</b>\n"
-    "По всем вопросам - @cashoutta1\n"
+# =========================
+# Поддержка / FAQ / Политика / Соцсети
+# =========================
+SUPPORT_USERNAME = "@cashoutta1"
+NEWS_CHANNEL_URL = "https://t.me/bincheker_news"
+PRIVACY_URL = "https://telegra.ph/Politika-konfidencialnosti--card-bin-checkerbot-01-13"
+FAQ_URL = "https://telegra.ph/FAQ--WorkBin-Bot-01-13"
+
+SUPPORT_TEXT = (
+    "📚 <b>Помощь</b>\n\n"
+    f"✉️ <b>Контакты</b>:\n{SUPPORT_USERNAME} | Cотрудничество\n\n"
+    "💎 <b>Социальные сети</b>:\n"
+    "BIN Чекер | Новости и Обновления\n"
+    f"{NEWS_CHANNEL_URL}\n\n"
+    "📝 <b>Условия пользования</b>:\n"
+    f"{PRIVACY_URL}\n\n"
+    "📗 <b>F.A.Q</b>:\n"
+    f"{FAQ_URL}"
 )
+
+SUPPORT_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("✉️ Контакты (сотрудничество)", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}")],
+    [InlineKeyboardButton("💎 Новости и обновления", url=NEWS_CHANNEL_URL)],
+    [InlineKeyboardButton("📗 F.A.Q", url=FAQ_URL)],
+    [InlineKeyboardButton("📝 Условия пользования", url=PRIVACY_URL)],
+])
+
 
 # =========================
 # Глобальные переменные
@@ -90,7 +112,7 @@ def is_admin_user(update: Update) -> bool:
 
 def build_menu(is_admin: bool) -> ReplyKeyboardMarkup:
     rows = [
-        [KeyboardButton("🤝 Сотрудничество"), KeyboardButton("📈 Курс Rapira")]
+        [KeyboardButton("📚 Помощь"), KeyboardButton("📈 Курс Rapira")]
     ]
     if is_admin:
         rows.append([KeyboardButton("📊 Статистика"), KeyboardButton("📣 Рассылка")])
@@ -126,11 +148,9 @@ async def _db_connect():
     if _db_pool is None:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL не задан. Добавь в .env и в Render Env.")
-        # max_size можно увеличить, но 5 обычно достаточно
         _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
 async def _db_init_schema():
-    # На всякий случай создаём таблицы (не ломает, если уже есть)
     await _db_connect()
     async with _db_pool.acquire() as conn:
         await conn.execute("""
@@ -192,7 +212,6 @@ async def db_fetchall(query: str, params=()):
     async with _db_pool.acquire() as conn:
         return await conn.fetch(query, *params)
 
-
 async def ensure_daily_row(day: str):
     await db_execute(
         "INSERT INTO daily (day, starts, requests, unique_users) VALUES ($1, 0, 0, 0) "
@@ -212,7 +231,6 @@ async def mark_unique_user_day(user_id: int, day: str) -> bool:
     )
     return row is not None
 
-# ✅ Оптимизация: UPSERT вместо SELECT + INSERT/UPDATE
 async def upsert_user(user_id: int, username: str | None):
     day = today_str()
     await ensure_daily_row(day)
@@ -281,7 +299,6 @@ async def get_stats_text() -> str:
 # BIN DB
 # =========================
 def load_db():
-    """Загрузка базы BIN-кодов из ZIP-архива"""
     try:
         csv_path = "full_bins.csv"
         if not os.path.exists(csv_path):
@@ -305,7 +322,6 @@ def load_db():
         return False
 
 def get_card_scheme(bin_code: str) -> str:
-    """Определение платёжной системы по BIN-коду"""
     if not bin_code.isdigit() or len(bin_code) < 6:
         return "Unknown"
 
@@ -326,10 +342,6 @@ def get_card_scheme(bin_code: str) -> str:
 # Rapira rate
 # =========================
 async def fetch_rapira_usdt_rub() -> dict | None:
-    """
-    Тянем через публичный API Rapira: /open/market/rates
-    Ищем symbol == "USDT/RUB"
-    """
     now_ts = asyncio.get_event_loop().time()
     if _rapira_cache["data"] is not None and (now_ts - _rapira_cache["ts"]) < _RAPIRA_CACHE_SECONDS:
         return _rapira_cache["data"]
@@ -356,16 +368,11 @@ async def fetch_rapira_usdt_rub() -> dict | None:
 # PAN hash counter (safe)
 # =========================
 def pan_to_hash(pan_digits: str) -> str:
-    """
-    ВАЖНО: Telegram callback_data <= 64 байт.
-    Поэтому используем короткий стабильный ID (32 символа) на основе sha256+salt.
-    """
     salt = CARD_HASH_SALT or "default_salt_change_me"
     digest = hashlib.sha256((salt + pan_digits).encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")[:32]
 
 async def inc_pan_hash(h: str) -> int:
-    """Атомарно увеличиваем cnt, возвращаем новое значение"""
     row = await db_fetchone(
         """
         INSERT INTO pan_hash (h, cnt)
@@ -403,7 +410,6 @@ async def track_start_bg(user_id: int, username: str | None):
     await inc_start(user_id)
 
 async def track_request_bg(user_id: int, username: str | None):
-    # не влияет на текст ответа (кроме full PAN счётчика — он отдельно)
     await upsert_user(user_id, username)
     await inc_request(user_id)
 
@@ -416,7 +422,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    # ✅ ускоряем: учёт делаем в фоне
     fire_and_forget(asyncio.create_task(track_start_bg(user.id, user.username)))
 
     await update.message.reply_text(
@@ -528,8 +533,12 @@ async def check_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Menu buttons
-    if text_raw == "🤝 Сотрудничество":
-        await update.message.reply_text(COOP_TEXT, parse_mode="HTML", reply_markup=build_menu(is_admin_user(update)))
+    if text_raw == "📚 Помощь":
+        await update.message.reply_text(
+            SUPPORT_TEXT,
+            parse_mode="HTML",
+            reply_markup=SUPPORT_KB
+        )
         return
 
     if text_raw == "📈 Курс Rapira":
@@ -572,7 +581,6 @@ async def check_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ✅ ускоряем: учёт запроса делаем в фоне (не влияет на ответ)
     fire_and_forget(asyncio.create_task(track_request_bg(user.id, user.username)))
 
     is_full_pan = len(digits) >= 12
@@ -582,7 +590,6 @@ async def check_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     issuer = "Unknown"
     country = "Unknown"
 
-    # BIN lookup: локальная база -> иначе binlist
     if bin_code in bin_db:
         data = bin_db[bin_code]
         issuer = data.get("Issuer", issuer)
@@ -606,7 +613,6 @@ async def check_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_full_pan:
         h = pan_to_hash(digits)
 
-        # ✅ ускоряем: cnt и flag параллельно
         cnt, is_problem = await asyncio.gather(
             inc_pan_hash(h),
             get_pan_flag(h)
@@ -639,7 +645,6 @@ def build_web_app(application: Application) -> web.Application:
         return web.Response(text="OK", status=200)
 
     async def telegram_webhook(request: web.Request):
-        # Secret header check (если задан)
         if WEBHOOK_SECRET:
             secret_hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
             if secret_hdr != WEBHOOK_SECRET:
@@ -678,10 +683,8 @@ async def run_bot():
         logger.error("TELEGRAM_TOKEN не найден!")
         return
 
-    # init db schema
     await db_init()
 
-    # Create PTB application
     application = Application.builder() \
         .token(token) \
         .concurrent_updates(False) \
@@ -701,13 +704,10 @@ async def run_bot():
     await application.initialize()
     await application.start()
 
-    # Запуск HTTP сервера (чтобы Render Web Service не падал)
     http_runner = await run_http_server(port, application)
 
-    # ВАЖНО: ставим webhook (Render Web Service)
     if not WEBHOOK_URL:
         logger.error("WEBHOOK_URL не задан! Добавь WEBHOOK_URL=https://<service>.onrender.com/telegram")
-        # без webhook сервис будет жить, но апдейтов не будет
     else:
         await application.bot.set_webhook(
             url=WEBHOOK_URL,
@@ -716,7 +716,6 @@ async def run_bot():
         )
         logger.info(f"Webhook установлен: {WEBHOOK_URL}")
 
-    # Keep alive
     try:
         while True:
             await asyncio.sleep(3600)
