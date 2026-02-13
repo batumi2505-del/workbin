@@ -33,20 +33,24 @@ from aiohttp import web
 
 
 # =========================
-# Настройка логов
-# =========================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# =========================
 # Константы/настройки
 # =========================
 TZ = ZoneInfo("Asia/Tbilisi")
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
+def parse_admin_ids() -> set[int]:
+    # Новый формат: ADMIN_IDS="111,222,333"
+    raw = (os.getenv("ADMIN_IDS", "") or "").strip()
+    if raw:
+        parts = [p.strip() for p in raw.replace(";", ",").split(",")]
+        ids = {int(p) for p in parts if p.isdigit() and int(p) != 0}
+        return ids
+
+    # Backward-compatible: если оставил старый ADMIN_ID
+    one = (os.getenv("ADMIN_ID", "0") or "0").strip()
+    return {int(one)} if one.isdigit() and int(one) != 0 else set()
+
+ADMIN_IDS = parse_admin_ids()
+
 CARD_HASH_SALT = os.getenv("CARD_HASH_SALT", "")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")  # Supabase Pooler Session URL
@@ -108,7 +112,8 @@ def now_iso() -> str:
     return datetime.now(TZ).isoformat(timespec="seconds")
 
 def is_admin_user(update: Update) -> bool:
-    return ADMIN_ID != 0 and update.effective_user and update.effective_user.id == ADMIN_ID
+    u = update.effective_user
+    return bool(u and u.id in ADMIN_IDS)
 
 def build_menu(is_admin: bool) -> ReplyKeyboardMarkup:
     rows = [
@@ -758,3 +763,4 @@ if __name__ == "__main__":
         logger.info("Бот остановлен по запросу пользователя")
     except Exception as e:
         logger.error(f"Фатальная ошибка: {str(e)}")
+
