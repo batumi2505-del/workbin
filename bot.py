@@ -31,6 +31,14 @@ from telegram.ext import (
 )
 from aiohttp import web
 
+# =========================
+# Настройка логов
+# =========================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # =========================
 # Константы/настройки
@@ -763,4 +771,5 @@ if __name__ == "__main__":
         logger.info("Бот остановлен по запросу пользователя")
     except Exception as e:
         logger.error(f"Фатальная ошибка: {str(e)}")
+
 
